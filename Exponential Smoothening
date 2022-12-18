@@ -1,0 +1,40 @@
+def tes_model(train, horizon, model_params):
+
+    '''
+    It gets the best parameters for smoothening level, trend , seasonality.
+    
+    '''
+    
+    params = {k: v for k, v in model_params.items() if v is not None}
+    
+    alpha     =  np.round(list(np.linspace(0.1,  0.9,  8)),  2)
+    beta      =  np.round(list(np.linspace(0.1,  0.9,  8)),  2)
+    gamma     =  np.round(list(np.linspace(0.1,  0.9,  8)),  2)
+    phi       =  np.round(list(np.linspace(0.1,  0.9,  8)),  2)
+    abgp_val  =  list(itertools.product(alpha,  beta,  gamma,  phi))
+    
+    wape  =  []
+
+    for abgp in abgp_val:
+        
+        model          =  ExponentialSmoothing(train,  trend = 'add',  seasonal = 'add',  damped = True, seasonal_periods = params["s_period"])
+        model_fit      =  model.fit(smoothing_level = abgp[0],  smoothing_slope = abgp[1],  smoothing_seasonal = abgp[2],  damping_slope = abgp[3],  optimized = False)
+        fitted_values  =  model_fit.fittedvalues
+        wape_val       =  metrics(train,  fitted_values)[0]
+        wape.append(wape_val)
+    
+    param_es   =  abgp_val[np.nanargmin(wape)]
+    
+    tes_model   =  ExponentialSmoothing(train,  trend = 'add',  seasonal = 'add',  damped = True, seasonal_periods = params["s_period"])
+    tes_fit     =  tes_model.fit(smoothing_level = param_es[0],  smoothing_slope = param_es[1],  smoothing_seasonal = param_es[2],  damping_slope = param_es[3],  optimized = False)
+    tes_frcst   =  tes_fit.forecast(horizon)
+    tes_fitted  =  tes_fit.fittedvalues
+    
+    final_tes_frcst = []
+    for i in tes_frcst:
+        if i<0:
+            final_tes_frcst.append(0)
+        else:
+            final_tes_frcst.append(i)
+   
+    return(param_es, final_tes_frcst,  tes_fitted)
