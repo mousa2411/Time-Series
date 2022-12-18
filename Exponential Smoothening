@@ -38,3 +38,82 @@ def tes_model(train, horizon, model_params):
             final_tes_frcst.append(i)
    
     return(param_es, final_tes_frcst,  tes_fitted)
+def ses_model(train, horizon):
+
+    '''
+    It gets the best parameter for smoothening level.
+    
+    '''
+
+    alpha = np.round(list(np.linspace(0.1, 0.9, 17)), 2)
+
+    wape = []
+
+    for a in alpha:
+        
+        model         = SimpleExpSmoothing(train)
+        model_fit     = model.fit(smoothing_level=a, optimized=False)
+        fitted_values = model_fit.fittedvalues
+        wape_val      = metrics(train, fitted_values)[0]
+        wape.append(wape_val)
+
+    param_es  = alpha[np.nanargmin(wape)]
+
+    ses_model  = SimpleExpSmoothing(train)
+    ses_fit    = ses_model.fit(smoothing_level=param_es, optimized=False)
+    ses_frcst  = ses_fit.forecast(horizon)
+    ses_fitted = ses_fit.fittedvalues
+
+    final_ses_frcst = []
+
+    for i in ses_frcst:
+        if i<0:
+            final_ses_frcst.append(0)
+        else:
+            final_ses_frcst.append(i)
+
+    return (param_es, final_ses_frcst, ses_fitted)
+
+
+def des_model(train, horizon):
+
+    '''
+    It gets the best parameters for smoothening level, trend
+    
+    '''
+    
+    alpha    = np.round(list(np.linspace(0.1, 0.9, 17)), 2)
+    beta     = np.round(list(np.linspace(0.1, 0.9, 17)), 2)
+    phi      = np.round(list(np.linspace(0.1, 0.9, 17)), 2)
+    abp_val  = list(itertools.product(alpha, beta, phi))
+    
+    wape = []
+
+    for abp in abp_val:
+        
+        model = Holt(train, exponential=False, damped=True)
+        model_fit = model.fit(smoothing_level = abp[0], smoothing_slope = abp[1], damping_slope = abp[2], optimized = False)
+        fitted_values = model_fit.fittedvalues
+        wape_val      = metrics(train, fitted_values)[0]
+        wape.append(wape_val)
+    
+    param_es  = abp_val[np.nanargmin(wape)]
+    
+    des_model  = Holt(train, exponential=False, damped=True)
+    des_fit    = des_model.fit(smoothing_level=param_es[0], smoothing_slope=param_es[1], damping_slope=param_es[2], optimized=False)
+    des_frcst  = des_fit.forecast(horizon)
+    des_fitted = des_fit.fittedvalues
+    
+    final_des_frcst = []
+
+    for i in des_frcst:
+
+        if i<0:
+
+            final_des_frcst.append(0)
+
+        else:
+
+            final_des_frcst.append(i)
+
+    return(param_es, final_des_frcst, des_fitted) 
