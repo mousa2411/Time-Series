@@ -1,0 +1,158 @@
+def ann_model(train, horizon, model_params):
+
+    '''
+    
+    It return the best model after training
+
+    '''
+    
+    
+    params   = {k: v for k, v in model_params.items() if v is not None}
+    nn_train = train.reshape(-1,1)
+    scaler   = MinMaxScaler(feature_range = (0, 1))
+    
+    train_sc     = scaler.fit_transform(nn_train)  
+    Y_min, Y_max = scaler.data_min_[0], scaler.data_max_[0] 
+    
+    lag = params.pop('lag_n')
+    lag = int(lag)
+    
+    ann_features_set = []  
+    ann_labels       = []  
+    
+    for i in range(lag, len(nn_train)):
+        
+        ann_features_set.append(train_sc[(i-lag):i, 0])
+        ann_labels.append(train_sc[i, 0])
+        
+    ann_features_set, ann_labels = np.array(ann_features_set), np.array(ann_labels)  
+    
+    layers = params.pop('layers_n')
+    layers = int(layers)
+    nodes  = params.pop('nodes')
+    nodes.append(1)   
+
+    ann_model = Sequential()
+    ann_model.add(Dense(nodes[0], activation='relu', input_shape=(ann_features_set.shape[1], )))
+    
+    for i in range(layers-2):
+        
+        ann_model.add(Dense(nodes[i+1], activation='relu')) 
+        
+    ann_model.add(Dense(nodes[-1], activation='sigmoid')) 
+    ann_model.compile(loss='mean_squared_error', optimizer="adam")
+    ann_model.fit(ann_features_set, ann_labels, epochs=200, batch_size=10, verbose = 0) 
+    ann_fitted = ann_model.predict(ann_features_set)
+    ann_fitted = pd.Series(ann_fitted[:, 0]) * (Y_max - Y_min) + Y_min
+    
+    ann_fitted_vals = ann_fitted.values
+    
+    true_fitted = [None]*lag
+
+    for i in range(len(ann_fitted_vals)):
+        
+        true_fitted.append(ann_fitted_vals[i])
+
+    frcst = list(train_sc[-lag:, 0])
+
+    for i in range(horizon):
+        
+        frcst_feature = np.array([frcst[-lag:]])
+        frcst_value   = ann_model.predict(frcst_feature)
+        frcst.append(frcst_value[0][0])
+        
+    ann_frcst = pd.Series(frcst[-horizon:]) * (Y_max - Y_min) + Y_min
+    
+    ann_frcst = ann_frcst.values
+    
+    final_ann_frcst = []
+
+    for i in ann_frcst:
+
+        if i<0:
+            final_ann_frcst.append(0)
+
+        else:
+            final_ann_frcst.append(i)
+    
+    return(ann_model, final_ann_frcst, true_fitted)    
+
+
+def lstm_model(train, horizon, model_params):
+
+    '''
+    
+    It returns the best lstm model after training
+    
+    '''
+    
+    
+    params = {k: v for k, v in model_params.items() if v is not None}
+
+    nn_train = train.reshape(-1,1)
+
+    scaler   = MinMaxScaler(feature_range = (0, 1))
+    train_sc = scaler.fit_transform(nn_train)  
+    Y_min, Y_max = scaler.data_min_[0], scaler.data_max_[0] 
+
+    lag = params.pop('lag_n')
+    lag = int(lag)
+    
+    lstm_features_set = []  
+    lstm_labels       = []  
+    
+    for i in range(lag, len(nn_train)):  
+        
+        lstm_features_set.append(train_sc[(i-lag):i, 0])
+        lstm_labels.append(train_sc[i, 0])
+        
+    lstm_features_set, lstm_labels = np.array(lstm_features_set), np.array(lstm_labels) 
+    lstm_features_set = np.reshape(lstm_features_set, (lstm_features_set.shape[0], lstm_features_set.shape[1], 1)) 
+    
+    layers = params.pop('layers_n')
+    layers = int(layers)
+    nodes = params.pop('nodes')
+        
+    lstm_model = Sequential()
+    lstm_model.add(Bidirectional(LSTM(nodes[0], activation='relu', return_sequences=True, input_shape=(lstm_features_set.shape[1], 1))))
+    for i in range(layers-2):
+        
+        lstm_model.add(Bidirectional(LSTM(nodes[i+1], activation='relu', return_sequences=True)))
+        
+    lstm_model.add(Bidirectional(LSTM(nodes[-1], activation='relu')))                
+    lstm_model.add(Dense(1, activation='sigmoid'))
+    lstm_model.compile(loss='mean_squared_error', optimizer="adam")
+    lstm_model.fit(lstm_features_set, lstm_labels, epochs = 200, batch_size=10, verbose = 0) 
+    lstm_fitted = lstm_model.predict(lstm_features_set)
+    lstm_fitted = pd.Series(lstm_fitted[:, 0]) * (Y_max - Y_min) + Y_min
+    
+    lstm_fitted_vals = lstm_fitted.values
+    true_fitted     = [None]*lag
+    
+    for k in range(len(lstm_fitted_vals)):
+        
+        true_fitted.append(lstm_fitted_vals[k])
+        
+    frcst = list(train_sc[-lag:, 0])
+    for i in range(horizon):
+        
+        frcst_feature = np.array([frcst[-lag:]])
+        frcst_feature = np.reshape(frcst_feature, (frcst_feature.shape[0], frcst_feature.shape[1], 1)) 
+        frcst_value   = lstm_model.predict(frcst_feature)
+        frcst.append(frcst_value[0][0])
+        
+    lstm_frcst = pd.Series(frcst[-horizon:]) * (Y_max - Y_min) + Y_min
+    lstm_frcst = lstm_frcst.values
+    
+    final_lstm_frcst = []
+
+    for i in lstm_frcst:
+
+        if i<0:
+            final_lstm_frcst.append(0)
+
+        else:
+            final_lstm_frcst.append(i)
+
+    
+    return(lstm_model, final_lstm_frcst, true_fitted)    
