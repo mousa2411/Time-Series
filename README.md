@@ -1,1 +1,1 @@
-# Time-Series Models
+# Time-Series Forecasting Methods
