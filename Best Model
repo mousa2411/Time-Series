@@ -1,0 +1,276 @@
+
+def best_model_ses(df, param_es, config_dic):
+
+    '''
+    It is used for training all the skus in cluster using best model parameters
+    
+    '''
+    
+    horizon    = config_dic["Horizon"]['horizon']
+    ses_model  = SimpleExpSmoothing(df.loc[df.first_valid_index():,].values)
+    ses_fit    = ses_model.fit(smoothing_level=param_es, optimized=False)
+    ses_frcst  = ses_fit.forecast(horizon)
+    ses_fitted = ses_fit.fittedvalues
+    
+    final_ses_frcst = []
+
+    for i in ses_frcst:
+
+        if i<0:
+            final_ses_frcst.append(0)
+
+        else:
+            final_ses_frcst.append(i)
+    
+
+    return final_ses_frcst , ses_fitted
+    
+
+def best_model_des(df, param_es, config_dic):
+    
+    '''
+    It is used for training all the skus in cluster using best model parameters
+    
+    '''
+    
+    horizon    = config_dic["Horizon"]['horizon']
+    des_model  = Holt(df.loc[df.first_valid_index():,].values, exponential=False, damped=True)
+    des_fit    = des_model.fit(smoothing_level=param_es[0], smoothing_slope=param_es[1], damping_slope=param_es[2], optimized=False)
+    des_frcst  = des_fit.forecast(horizon)
+    des_fitted = des_fit.fittedvalues
+    
+    
+    final_des_frcst = []
+
+    for i in des_frcst:
+
+        if i<0:
+            final_des_frcst.append(0)
+
+        else:
+            final_des_frcst.append(i)
+    
+    return final_des_frcst , des_fitted
+    
+
+def best_model_tes(df, param_es, config_dic):
+
+    '''
+    It is used for training all the skus in cluster using best model parameters
+    
+    '''
+ 
+
+    horizon    = config_dic["Horizon"]['horizon']
+    s_period   = config_dic["Triple_ES"]['s_period']
+    tes_model_clus   =  ExponentialSmoothing(df.loc[df.first_valid_index():,].values,  trend = 'add',  seasonal = 'add',  damped = True, seasonal_periods = s_period)
+    tes_fit_clus     =  tes_model_clus.fit(smoothing_level = param_es[0],  smoothing_slope = param_es[1],  smoothing_seasonal = param_es[2],  damping_slope = param_es[3],  optimized = False)
+    tes_frcst_clus   =  tes_fit_clus.forecast(horizon)
+    tes_fitted_clus  =  tes_fit_clus.fittedvalues
+    
+    final_tes_frcst_clus = []
+
+    for i in tes_frcst_clus:
+
+        if i<0:
+            final_tes_frcst_clus.append(0)
+
+        else:
+            final_tes_frcst_clus.append(i)
+    
+    return final_tes_frcst_clus , tes_fitted_clus
+
+
+def best_model_arima(df, pdq_values, config_dic):
+
+    '''
+    It is used for training all the skus in cluster using best model parameters
+    
+    '''
+
+    horizon    = config_dic["Horizon"]['horizon']
+    arima_model_clus   =  ARIMA(df.loc[df.first_valid_index():, ].values,  order = pdq_values,enforce_stationarity=False)
+    arima_fit_clus     =  arima_model_clus.fit()
+    arima_frcst_clus   =  arima_fit_clus.forecast(horizon)
+    arima_fitted_clus  =  arima_fit_clus.fittedvalues
+    
+    final_arima_frcst_clus = []
+    for i in arima_frcst_clus:
+
+        if i<0:
+            final_arima_frcst_clus.append(0)
+
+        else:
+            final_arima_frcst_clus.append(i)
+        
+    return final_arima_frcst_clus , arima_fitted_clus
+    
+
+
+def best_model_rf(df, model, config_dic):
+
+    '''
+    It is used for training all the skus in cluster using best model parameters
+    
+    '''
+
+    horizon    = config_dic["Horizon"]['horizon']
+    lag, out_f = config_dic["RF_model"]["lag"], config_dic["RF_model"]["out"]
+    
+    train = df.loc[df.first_valid_index():, ].values
+    
+    data_con_x, data_con_y = ts_labelled(list(df.loc[df.first_valid_index():, ].values), lag, out_f)
+    model.fit(data_con_x,  data_con_y)
+    train_fitted = model.predict(data_con_x)
+    forecasts = []
+    
+    for j in range(horizon):
+
+        row   =  np.array(train[-lag:]).flatten()
+        yhat  =  model.predict(np.asarray([row]))
+        forecasts.append(yhat[0])
+        train = np.append(train, [yhat])
+
+    true_fitted = [None]*lag
+
+    for k in range(len(train_fitted)):
+
+        true_fitted.append(train_fitted[k])
+    
+    final_forecasts = []
+
+    for i in forecasts:
+
+        if i<0:
+            final_forecasts.append(0)
+
+        else:
+            final_forecasts.append(i)
+    
+    return final_forecasts , true_fitted
+    
+
+
+def best_model_ann(df, model, config_dic):
+
+    '''
+    It is used for training all the skus in cluster using best model parameters
+    
+    '''
+    
+    horizon    = config_dic["Horizon"]['horizon']
+    lag = config_dic["ANN"]["lag_n"]
+    nn_train = df.loc[df.first_valid_index():,].values.reshape(-1,1)
+    scaler   = MinMaxScaler(feature_range = (0, 1))
+    
+    train_sc     = scaler.fit_transform(nn_train)  
+    Y_min, Y_max = scaler.data_min_[0], scaler.data_max_[0] 
+    
+    ann_features_set = []  
+    ann_labels       = []  
+    
+    for i in range(lag, len(nn_train)):
+        
+        ann_features_set.append(train_sc[(i-lag):i, 0])
+        ann_labels.append(train_sc[i, 0])
+        
+    ann_features_set, ann_labels = np.array(ann_features_set), np.array(ann_labels)
+    
+    model.fit(ann_features_set, ann_labels, epochs=200, batch_size=10, verbose = 0) 
+    ann_fitted = model.predict(ann_features_set)
+    ann_fitted = pd.Series(ann_fitted[:, 0]) * (Y_max - Y_min) + Y_min
+    
+    ann_fitted_vals = ann_fitted.values
+    true_fitted     = [None]*lag
+    
+    for k in range(len(ann_fitted_vals)):
+        
+        true_fitted.append(ann_fitted_vals[k])
+
+    frcst = list(train_sc[-lag:, 0])
+    for i in range(horizon):
+        
+        frcst_feature = np.array([frcst[-lag:]])
+        frcst_value   = model.predict(frcst_feature)
+        frcst.append(frcst_value[0][0])
+        
+    ann_frcst = pd.Series(frcst[-horizon:]) * (Y_max - Y_min) + Y_min
+    ann_frcst_vals=ann_frcst.values
+    
+    final_ann_frcst=[]
+
+    for i in ann_frcst_vals:
+
+        if i<0:
+            final_ann_frcst.append(0)
+
+        else:
+            final_ann_frcst.append(i)
+
+    return final_ann_frcst , true_fitted
+    
+
+
+def best_model_lstm(df, model, config_dic):
+
+    '''
+    It is used for training all the skus in cluster using best model parameters
+    
+    '''
+    
+    horizon    = config_dic["Horizon"]['horizon']
+    lag = config_dic["LSTM"]["lag_n"]
+    nn_train = df.loc[df.first_valid_index():,].values.reshape(-1,1)
+    scaler   = MinMaxScaler(feature_range = (0, 1))
+    
+    train_sc     = scaler.fit_transform(nn_train)  
+    Y_min, Y_max = scaler.data_min_[0], scaler.data_max_[0] 
+    
+    lstm_features_set = []  
+    lstm_labels       = []  
+    
+    for i in range(lag, len(nn_train)):  
+        
+        lstm_features_set.append(train_sc[(i-lag):i, 0])
+        lstm_labels.append(train_sc[i, 0])
+        
+    lstm_features_set, lstm_labels = np.array(lstm_features_set), np.array(lstm_labels) 
+    lstm_features_set = np.reshape(lstm_features_set, (lstm_features_set.shape[0], lstm_features_set.shape[1], 1)) 
+
+    model.fit(lstm_features_set, lstm_labels, epochs=200, batch_size=10, verbose = 0) 
+    lstm_fitted = model.predict(lstm_features_set)
+    lstm_fitted = pd.Series(lstm_fitted[:, 0]) * (Y_max - Y_min) + Y_min
+    
+    
+    
+    lstm_fitted_vals = lstm_fitted.values
+    true_fitted     = [None]*lag
+    
+    for k in range(len(lstm_fitted_vals)):
+        
+        true_fitted.append(lstm_fitted_vals[k])
+
+    frcst = list(train_sc[-lag:, 0])
+
+    for i in range(horizon):
+        
+        frcst_feature = np.array([frcst[-lag:]])
+        frcst_feature = np.reshape(frcst_feature, (frcst_feature.shape[0], frcst_feature.shape[1], 1)) 
+        frcst_value   = model.predict(frcst_feature)
+        frcst.append(frcst_value[0][0])
+        
+    lstm_frcst = pd.Series(frcst[-horizon:]) * (Y_max - Y_min) + Y_min
+    
+    lstm_frcst_vals = lstm_frcst.values
+    
+    final_lstm_frcst_vals=[]
+
+    for i in lstm_frcst_vals:
+
+        if i<0:
+            final_lstm_frcst_vals.append(0)
+            
+        else:
+            final_lstm_frcst_vals.append(i)
+
+    return final_lstm_frcst_vals , true_fitted
