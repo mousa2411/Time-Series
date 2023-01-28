@@ -1,4 +1,4 @@
-## Time-Series Forecasting Methods functions-
+## Time-Series Forecasting Methods functions--
 1. ARIMA
 2. Exponential Smoothing
 3. Randomforest
