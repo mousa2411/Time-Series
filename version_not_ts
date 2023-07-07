@@ -1,0 +1,1209 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Apr 14 11:08:46 2021
+
+CODE TO EXPAND LOSS FORECASTING
+
+Version 1.1 Updated 5/13/2021: 
+This code uses an additonal date varioble
+
+Version 1.2 Updated 5/20/201:
+This code adds seasonality in the balance
+
+Version 1.3 Updated 5/26/2021:
+This code adds R2 (rsquared), rmse
+For months 7 to 12 we could try using a moving average
+try 3 month or 6 month window
+also fixed criteria for Roll_Rate_Mean_np
+added plots for 30+
+
+Version 1.4 Updated 5/28/2021
+Now uses a version of roll rates which the risk book uses
+Also for Delinq_No_Deceased_Bankruptcy_Now include 150+
+
+Version 1.5
+
+Version 1.6 Update 6/22/2021
+Changed the clipping for balance forecast to within loop
+
+Version 1.7 Update 7/7/2021
+Reverting back to previous version of Roll Rates (it might better model the
+30+)
+Also adding option to smooth out months 7-12 with roll rates
+To aggregate rates also added quantile option instead of using median
+Added column of Delinq_CO
+
+Version 1.8 Update 7/16/2021
+For month 8 use an average to fill the delinquency bucket at month 8
+but then for months 8-12 continue to apply roll rates
+no need for use_moving_average boolean variable
+For version 1.8 Add overall percent error
+Correction Roll Rates should EXCLUDE 'DEATH', 'BANKRUPTCY'
+
+Version 1.9 Update 7/21/2021
+Extend to use different quantiles for different roll rates
+Allows to use which roll rate methodology to use
+
+Version 2 Update 11/11/2021
+Add Seasonality into the forecast for periods beyond
+
+Version 2.1 Update 8/2/2022
+Took out clipping from Balance Forecast
+
+
+@author: psriva3
+"""
+
+#Import libraries
+##############################
+import pandas as pd
+import numpy as np
+import pyodbc
+import os as os
+###############################
+
+###############################
+#from pandas.tseries.offsets import DateOffset
+###############################
+
+#Import Stats Models
+#import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from statsmodels.tsa.seasonal import seasonal_decompose #Added 10/25/2021
+
+##############################################################################
+##Inputs for program
+version_= 'Version 2.0'
+
+####################################
+#Define an As of Date, the forecast will be as of the As of Date
+#AsOfDate is normalized to the beginning of the month
+AsOfDate = '2023-05-01' #<-CHANGE THIS
+user_name = 'vkumar34'  #<-UPDATE USER NAME ADDED 3/27/2023
+path_name = "C:/Users/{}/Ameriprise/FSB Credit - Documents/Credit Risk Management/Credit Risk Report/Credit Card"#<-UPDATE/Check the path before running the code 4/04/2023
+# path_name = "C:/Users/{}/Ameriprise/FSB Credit - Credit Risk Management/Credit Risk Report/Credit Card"
+
+export_Excel = True #Whether to export Excel or not #<-SET TO TRUE TO EXPORT TO EXCEL
+####################################
+
+
+forecast_period = 12 #TO DO KEEP THIS AS 12 TO GET 1 YEAR FORECAST
+
+#When set to False use AsofDate
+#When set to True use maximum Date
+max_date_Boolean = False
+match_risk_book_roll_rates = True #Uses a method for roll rates that matches risk book
+#If false then uses "pure" roll rates
+
+
+# Number of periods to use when aggregating Roll Rates, Deceased, Bankuptcies
+n_period_lookback = 12 #Set to None to look back on entire of history
+
+# Seasonality Date Cutoff, Keep the seasonality fixed to be revisted every six months
+Seasonality_CutOff_Date = '2021-10-01' #<-This will be accessed every 6 months
+
+#Note the following convention will be used
+#0 : Current
+#1 : 1-29 Days
+#2 : 30-59 Days
+#3 : 60-89 Days
+#4 : 90-119 Days
+#5 : 120-149 Days
+#6 : 150-179 Days
+#7 : CO
+
+
+
+use_quantile = True #Set to True to use quantile, set to False to use mean
+
+Roll_Categories_List = ['0 -> 1', '1 -> 2', '2 -> 3', '3 -> 4', '4 -> 5', '5 -> 6', '6 -> 7']
+Other_Roll_To_Loss_List = ['0 -> 7', '1 -> 7', '2 -> 7', '3 -> 7', '4 -> 7', '5 -> 7']
+
+quantile_ = 0.5 #Used to aggregate Recoveries, Bankrtupcies etc
+quantile_roll_rates_dict = {'0 -> 1' : 0.5, '1 -> 2' : 0.5, '2 -> 3' : 0.5, \
+                            '3 -> 4' : 0.5, '4 -> 5' : 0.5, '5 -> 6' : 0.5, \
+                            '6 -> 7' : 0.5} 
+
+file_name = str(pd.to_datetime(AsOfDate).year) + str(pd.to_datetime(AsOfDate).month).zfill(2)
+
+file_path = os.path.join(path_name.format(user_name),\
+                       str(pd.to_datetime(AsOfDate).year*100 + pd.to_datetime(AsOfDate).month),'Output')
+    
+##############################################################################
+
+#Importing the data in sql-server
+
+##########SQL Connections
+conn = pyodbc.connect('Driver={SQL Server Native Client 11.0};'
+                      'Server=E3-AFSB.ampf.com,43314;'
+                      'Database=AFSB;'
+                      'Trusted_Connection=yes;')
+
+cursor = conn.cursor()
+###########################
+
+########################
+##Query Strings
+#Roll Rates looks at balances resulting from going from low to higher delinquencies
+#Use this string to look at only pure rolls
+Roll_Rate_String_Pure = '''
+;with Roll_CTE_1 AS (
+	SELECT
+	 a.*
+	,b.CO_Contract
+	,b.CO_Interest
+	,b.CO_Other
+	,ABS(b.CO_Late) AS CO_Late
+	,b.CO_Contract + b.CO_Interest + b.CO_Other + ABS(b.CO_Late) AS GrossCO
+	,CASE WHEN b.CO_Contract <> 0 THEN 7 ELSE Delinquency_Status_a END AS Delinquency_Status
+	,LAG(a.Balance) OVER (PARTITION BY a.COLAAcctID ORDER BY a.Batch_Date) AS LaggedBalance
+	FROM
+	(
+		SELECT
+		[COLAAcctID]  AS COLAAcctID
+		,[Batch Date] AS Batch_Date
+		,CAST([Eom Balance Amount] AS float)/2 AS Balance
+		,CAST([Credit Limit Amount] AS float)/2 AS Line
+		,CAST([Delinquency Status Text] AS int) AS Delinquency_Status_a
+		,CASE WHEN [Number of Days Delinquent Text] < 0 THEN 0 ELSE [Number Of Days Delinquent Text] END AS Number_of_Days_Delinquent_Text
+		,[Account Status]
+		,CASE
+			 WHEN [Account Status] IS NULL THEN 'GOOD'
+			 WHEN [Account Status] = ''    THEN 'GOOD'
+			 WHEN [Account Status] = '1'   THEN 'BEING CLOSED'
+			 WHEN [Account Status] = '2'   THEN 'LOST/STOLEN CARD'
+			 WHEN [Account Status] = '3'   THEN 'TEMPORARY RESTRAINT'
+			 WHEN [Account Status] = '4'   THEN 'CLOSED (ZERO BALANCE)'
+			 WHEN [Account Status] = '5'   THEN 'PERMANENT RESTRAINT'
+			 WHEN [Account Status] = '6'   THEN 'LOST/STOLEN CARD'
+			 WHEN [Account Status] = '7'   THEN 'GOOD'
+			 WHEN [Account Status] = '8'   THEN 'FRAUD'
+			 WHEN [Account Status] = '9'   THEN 'BAD DEBT'	
+		END AS Account_Status_Description_Text
+		,CASE
+			WHEN [Auxiliary Status Description 1 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'
+			WHEN [Auxiliary Status Description 2 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'	 
+			WHEN [Auxiliary Status Description 3 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'	
+			WHEN [Auxiliary Status Description 4 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'
+			WHEN [Auxiliary Status Description 5 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'	 
+			WHEN [Auxiliary Status Description 6 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'	
+			WHEN [Auxiliary Status Description 1 Text] = 'DEATH' THEN 'DEATH'
+			WHEN [Auxiliary Status Description 2 Text] = 'DEATH' THEN 'DEATH'
+			WHEN [Auxiliary Status Description 3 Text] = 'DEATH' THEN 'DEATH'
+			WHEN [Auxiliary Status Description 4 Text] = 'DEATH' THEN 'DEATH'
+			WHEN [Auxiliary Status Description 5 Text] = 'DEATH' THEN 'DEATH'
+			WHEN [Auxiliary Status Description 6 Text] = 'DEATH' THEN 'DEATH'
+		ELSE 'OTHER' END AS Special_Status 									 			 						  
+		FROM [dbo].[VW1_PII_USBNK_CRED_DTL_MTHLY]
+		WHERE COALESCE([Account Status], '0') IN ('0', '', '1', '3', '5', '7', '9') 
+	) a
+	LEFT JOIN
+	(
+		SELECT
+		[COLAAcctID]
+		,[Batch Date] AS Batch_Date
+		,[Account Status Description Text] AS Account_Status_Description_Text
+		,CAST([Charge Off Contractual Amount] AS float)/2 AS CO_Contract
+		,CAST([Charge Off Interest Amount] AS float)/2 AS CO_Interest
+		,CAST([Charge Off Other Fee Amount] AS float)/2 AS CO_Other
+		,CAST([Charge-Off Late Fee Amount] AS float)/2 AS CO_Late
+		FROM [dbo].[VW1_NPII_USBNK_FIN_DTL_MTHLY]
+		WHERE [Account Status Description Text] IN ('GOOD', 'BEING CLOSED', 'TEMPORARY RESTRAINT', 'PERMANENT RESTRAINT', 'BAD DEBT')
+	) b
+	ON a.COLAAcctID = b.COLAAcctID AND a.Batch_Date = b.Batch_Date AND a.Account_Status_Description_Text = b.Account_Status_Description_Text
+	WHERE ((a.[Account_Status_Description_Text] IN ('GOOD', 'BEING CLOSED', 'TEMPORARY RESTRAINT', 'PERMANENT RESTRAINT'))  OR (b.CO_Contract <> 0 ))
+),
+ROLL_CTE_2 AS (
+	SELECT
+	*,
+	LAG(Delinquency_Status) OVER (PARTITION BY COLAAcctId ORDER BY Batch_Date) AS Lagged_Delinquency_Status
+	FROM ROLL_CTE_1 
+)
+SELECT
+Batch_Date
+,Delinquency_Status AS TO_Delinquency
+,Lagged_Delinquency_Status AS FROM_Delinquency
+,SUM(ROLL_Balance) AS ROLL_BALANCE
+,SUM(CASE WHEN ROLL_Balance > 0 THEN 1 ELSE 0 END) AS ROLL_Units
+FROM
+(
+	SELECT  
+	*,
+	CASE 
+		WHEN COALESCE(LaggedBalance, 0) = 0 THEN 0
+		WHEN Delinquency_Status > Lagged_Delinquency_Status AND Delinquency_Status = 7 AND Special_Status NOT IN ('BANKRUPTCY', 'DEATH') THEN GrossCO
+		WHEN Delinquency_Status > Lagged_Delinquency_Status AND Delinquency_Status < 7 AND Special_Status NOT IN ('BANKRUPTCY', 'DEATH') THEN Balance
+		ELSE 0 END AS ROLL_Balance
+	FROM ROLL_CTE_2
+) a
+GROUP BY Batch_Date, Delinquency_Status, Lagged_Delinquency_Status
+HAVING SUM(ROLL_Balance) > 0
+ORDER BY Batch_Date, Delinquency_Status, Lagged_Delinquency_Status
+
+'''
+#Use this string if wanting to go with the methodology of roll rates used
+#in the risk book
+Roll_Rate_String_RB = '''
+;with DELINQ_CO AS (
+	SELECT
+	a.COLAAcctId
+	,a.Batch_Date
+	,CASE 
+		WHEN COALESCE(b.Gross_CO, 0) > 0 THEN 7 
+		WHEN b.[Account Status Description Text] = 'BAD DEBT' THEN 999
+	ELSE a.Delinquency_Status END AS Delinquency_Status
+	,CASE 
+		WHEN COALESCE(b.Gross_CO, 0) > 0 AND a.Special_Account_Status NOT IN ('DEATH', 'BANKRUPTCY') THEN b.Gross_CO 
+		WHEN COALESCE(b.Gross_CO, 0) > 0 AND a.Special_Account_Status IN ('DEATH', 'BANKRUPTCY') THEN 0
+	ELSE a.Balance   
+	END AS Balance 
+	FROM 
+	(
+		SELECT
+		[COLAAcctID]
+		,[Batch Date] AS Batch_Date
+		,CAST([Delinquency Status Text] AS int) AS Delinquency_Status
+		,CAST([EOM Balance Amount] AS float)/2  AS Balance
+		,CASE
+			 WHEN [Auxiliary Status Description 1 Text] = 'DEATH' THEN 'DEATH'
+			 WHEN [Auxiliary Status Description 2 Text] = 'DEATH' THEN 'DEATH'
+			 WHEN [Auxiliary Status Description 3 Text] = 'DEATH' THEN 'DEATH'
+			 WHEN [Auxiliary Status Description 4 Text] = 'DEATH' THEN 'DEATH'
+			 WHEN [Auxiliary Status Description 5 Text] = 'DEATH' THEN 'DEATH'
+			 WHEN [Auxiliary Status Description 6 Text] = 'DEATH' THEN 'DEATH'
+			 WHEN [Auxiliary Status Description 1 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'
+			 WHEN [Auxiliary Status Description 2 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'
+			 WHEN [Auxiliary Status Description 3 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'
+			 WHEN [Auxiliary Status Description 4 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'
+			 WHEN [Auxiliary Status Description 5 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'
+			 WHEN [Auxiliary Status Description 6 Text] = 'BANKRUPTCY' THEN 'BANKRUPTCY'
+		 ELSE 'NONE' END AS Special_Account_Status
+		,CASE
+			 WHEN [Account Status] IS NULL THEN  'GOOD'
+			 WHEN [Account Status] = ''    THEN  'GOOD'
+			 WHEN [Account Status] = '1'   THEN  'BEING CLOSED'
+			 WHEN [Account Status] = '2'   THEN  'LOST/STOLEN CARD'
+			 WHEN [Account Status] = '3'   THEN  'TEMPORARY RESTRAINT'
+			 WHEN [Account Status] = '4'   THEN  'CLOSED (ZERO BALANCE)'
+			 WHEN [Account Status] = '5'   THEN  'PERMANENT RESTRAINT'
+			 WHEN [Account Status] = '6'   THEN  'LOST/STOLEN CARD'
+			 WHEN [Account Status] = '7'   THEN  'GOOD'
+			 WHEN [Account Status] = '8'   THEN  'FRAUD'
+			 WHEN [Account Status] = '9'   THEN  'BAD DEBT'
+		END AS Account_Status_Description_Text
+		FROM [dbo].[VW1_PII_USBNK_CRED_DTL_MTHLY]
+		WHERE COALESCE([Account Status],'0') IN ('', '0', '1', '3', '5', '7', '9')
+	) a
+	LEFT JOIN
+	(
+		SELECT
+		 [COLAAcctID]
+		,[Batch Date] AS Batch_Date
+		,[Account Status Description Text]
+		,CAST([Charge Off Contractual Amount] AS float)/2 + CAST([Charge Off Interest Amount] AS float)/2 + CAST([Charge Off Other Fee Amount] AS float)/2 + abs(CAST([Charge-Off Late Fee Amount] AS float))/2 AS Gross_CO
+		FROM [dbo].[VW1_NPII_USBNK_FIN_DTL_MTHLY]
+		WHERE [Account Status Description Text] = 'BAD DEBT'
+	) b
+	ON a.COLAAcctID = b.COLAAcctID AND a.Batch_Date = b.Batch_Date AND a.Account_Status_Description_Text = b.[Account Status Description Text]
+	WHERE Special_Account_Status = 'NONE'
+),
+Delinq_Summary_1 AS
+(
+	SELECT
+	Batch_Date
+	,Delinquency_Status
+	,SUM(Balance) AS Balance
+	FROM DELINQ_CO
+	GROUP BY Batch_Date, Delinquency_Status
+)
+SELECT
+a.*
+,COALESCE(b.Balance, 1e-6) AS Denominator
+,a.Balance/COALESCE(b.Balance, 1e-6) AS Roll_Rate
+FROM Delinq_Summary_1 a
+LEFT JOIN
+	 Delinq_Summary_1 b
+ON a.Delinquency_Status = b.Delinquency_Status + 1 
+WHERE DATEDIFF(MONTH, b.Batch_Date, a.Batch_Date) = 1 AND a.Delinquency_Status <> 999
+ORDER BY Batch_Date, Delinquency_Status
+'''
+#Delinqunecies (Includes Deceased and Bankruptcy)
+Delinq_String = '''
+SELECT
+Batch_Date
+,Delinquency_Status
+,SUM(Balance) AS Balance
+,COUNT(Balance) AS Units
+,SUM(Line) AS Line
+FROM
+(
+	SELECT
+	[COLAAcctID]  AS COLAAcctID
+	,[Batch Date] AS Batch_Date
+	,CAST([Eom Balance Amount] AS float)/2 AS Balance
+	,CAST([Credit Limit Amount] AS float)/2 AS Line
+	,CAST([Delinquency Status Text] AS int) AS Delinquency_Status
+	,[Account Status]
+	FROM [dbo].[VW1_PII_USBNK_CRED_DTL_MTHLY]
+	WHERE COALESCE([Account Status], '0') IN ('0', '', '1', '3', '5', '7')
+) a 
+GROUP BY Batch_Date, Delinquency_Status
+ORDER BY Batch_Date, Delinquency_Status
+'''
+
+
+#Delinqunecies (Includes Deceased and Bankruptcy)
+Delinq_String = '''
+SELECT
+Batch_Date
+,Delinquency_Status
+,SUM(Balance) AS Balance
+,COUNT(Balance) AS Units
+,SUM(Line) AS Line
+FROM
+(
+	SELECT
+	[COLAAcctID]  AS COLAAcctID
+	,[Batch Date] AS Batch_Date
+	,CAST([Eom Balance Amount] AS float)/2 AS Balance
+	,CAST([Credit Limit Amount] AS float)/2 AS Line
+	,CAST([Delinquency Status Text] AS int) AS Delinquency_Status
+	,[Account Status]
+	FROM [dbo].[VW1_PII_USBNK_CRED_DTL_MTHLY]
+	WHERE COALESCE([Account Status], '0') IN ('0', '', '1', '3', '5', '7')
+) a 
+GROUP BY Batch_Date, Delinquency_Status
+ORDER BY Batch_Date, Delinquency_Status
+'''
+
+#Delinquencies (Excludes Deceased and Bankruptcy)
+Delinq_No_Deceased_Bankrupt_String = '''
+SELECT
+Batch_Date
+,Delinquency_Status
+,SUM(Balance) AS Balance
+,COUNT(Balance) AS Units
+,SUM(Line) AS Line
+FROM
+(
+	SELECT
+	[COLAAcctID]  AS COLAAcctID
+	,[Batch Date] AS Batch_Date
+	,CAST([Eom Balance Amount] AS float)/2 AS Balance
+	,CAST([Credit Limit Amount] AS float)/2 AS Line
+	,CAST([Delinquency Status Text] AS int) AS Delinquency_Status
+	,[Account Status]
+	FROM [dbo].[VW1_PII_USBNK_CRED_DTL_MTHLY]
+	WHERE COALESCE([Account Status], '0') IN ('0', '', '1', '3', '5', '7') AND
+	((
+		CASE 
+			 WHEN [Auxiliary Status Description 1 Text] IN ('DEATH', 'BANKRUPTCY') THEN 1
+			 WHEN [Auxiliary Status Description 2 Text] IN ('DEATH', 'BANKRUPTCY') THEN 1
+			 WHEN [Auxiliary Status Description 3 Text] IN ('DEATH', 'BANKRUPTCY') THEN 1
+			 WHEN [Auxiliary Status Description 4 Text] IN ('DEATH', 'BANKRUPTCY') THEN 1
+			 WHEN [Auxiliary Status Description 5 Text] IN ('DEATH', 'BANKRUPTCY') THEN 1
+			 WHEN [Auxiliary Status Description 6 Text] IN ('DEATH', 'BANKRUPTCY') THEN 1
+		ELSE 0 END
+	) = 0
+    )
+) a 
+GROUP BY Batch_Date, Delinquency_Status
+ORDER BY Batch_Date, Delinquency_Status
+'''
+
+#Losses (Charge Offs) and Recoveries
+#Note Gross Charge Off = Contract + Interest + Other + ABS(Late Fee)
+#Late Fee appears with a negative sign in opposite to other charge offs
+CO_String = '''
+SELECT
+*
+,CO_Contract + CO_Interest + CO_Other + CO_Late AS GrossCO
+FROM
+(
+	SELECT
+	a.[COLAAcctID]
+	,a.[Batch Date] AS Batch_Date
+	,[Account Status Description Text] AS Account_Status_Description_Text
+	,b.[Auxiliary Status Description 1 Text] AS Auxiliary_Status_Description_1_Text
+	,b.[Auxiliary Status Description 2 Text] AS Auxiliary_Status_Description_2_Text
+	,b.[Auxiliary Status Description 3 Text] AS Auxiliary_Status_Description_3_Text
+	,b.[Auxiliary Status Description 4 Text] AS Auxiliary_Status_Description_4_Text
+	,b.[Auxiliary Status Description 5 Text] AS Auxiliary_Status_Description_5_Text
+	,b.[Auxiliary Status Description 6 Text] AS Auxiliary_Status_Description_6_Text
+	,CAST([Charge Off Contractual Amount] AS float)/2 AS CO_Contract
+	,CAST([Charge Off Interest Amount] AS float)/2 AS CO_Interest
+	,CAST([Charge Off Other Fee Amount] AS float)/2 AS CO_Other
+	,ABS(CAST([Charge-Off Late Fee Amount] AS float))/2 AS CO_Late
+	,CAST([Charge Off Recovery Bankruptcy Amount] AS float)/2 AS Recovery_Bankruptcy
+	,CAST([Charge Off Recovery Contractual Amount] AS float)/2 AS Recovery_Contract
+	FROM [dbo].[VW1_NPII_USBNK_FIN_DTL_MTHLY] a
+	LEFT JOIN
+		[dbo].[VW1_PII_USBNK_CRED_DTL_MTHLY] b
+	ON a.COLAAcctId = b.COLAAcctId AND a.[Batch Date] = b.[Batch Date]
+	WHERE a.[Account Status Description Text] = 'BAD DEBT' AND
+	b.[Account Status] = '9'
+) a
+WHERE CO_Contract <> 0 OR Recovery_Bankruptcy <> 0 OR Recovery_Contract <> 0 OR CO_Late <> 0 OR CO_Other <> 0 OR CO_Interest <> 0
+'''
+
+#New Bankruptcy and Deceased
+Bankruptcy_Deceased_String = '''
+SELECT		
+Batch_Date
+,Category
+,SUM(Balance) AS Balance		
+FROM 		
+( 		
+	 SELECT	
+	 [COLAAcctId]	
+	,[Batch Date] AS Batch_Date	
+	,'DECEASED' AS Category
+	,[Auxiliary Status Description 1 Text]	
+	,[Auxiliary Status Description 2 Text]	
+	,[Auxiliary Status Description 3 Text]	
+	,[Auxiliary Status Description 4 Text]	
+	,[Auxiliary Status Description 5 Text]	
+	,[Auxiliary Status Description 6 Text]	
+	,[State of Residence]	
+	,[Account Status]	
+	,[Updated Fico Score Number]	
+	,CAST([EOM Balance Amount] AS float)/2 AS Balance	
+	,MIN([Batch Date]) OVER (PARTITION BY COLAAcctID) AS MIN_DAte	
+	FROM [dbo].[VW1_PII_USBNK_CRED_DTL_MTHLY]	
+	WHERE COALESCE([Account Status] ,'0') IN ('', '0', '1', '3', '5', '7') AND	
+	(CASE	
+		WHEN [Auxiliary Status Description 1 Text] = 'DEATH' THEN 1
+		WHEN [Auxiliary Status Description 2 Text] = 'DEATH' THEN 1
+		WHEN [Auxiliary Status Description 3 Text] = 'DEATH' THEN 1
+		WHEN [Auxiliary Status Description 4 Text] = 'DEATH' THEN 1
+		WHEN [Auxiliary Status Description 5 Text] = 'DEATH' THEN 1
+		WHEN [Auxiliary Status Description 6 Text] = 'DEATH' THEN 1
+	ELSE 0 END) = 1	
+	UNION SELECT
+	 [COLAAcctId]	
+	,[Batch Date] AS Batch_Date	
+	,'BANKRUPTCY' AS Category
+	,[Auxiliary Status Description 1 Text]	
+	,[Auxiliary Status Description 2 Text]	
+	,[Auxiliary Status Description 3 Text]	
+	,[Auxiliary Status Description 4 Text]	
+	,[Auxiliary Status Description 5 Text]	
+	,[Auxiliary Status Description 6 Text]	
+	,[State of Residence]	
+	,[Account Status]	
+	,[Updated Fico Score Number]	
+	,CAST([EOM Balance Amount] AS float)/2 AS Balance	
+	,MIN([Batch Date]) OVER (PARTITION BY COLAAcctID) AS MIN_Date	
+	FROM [dbo].[VW1_PII_USBNK_CRED_DTL_MTHLY]	
+	WHERE COALESCE([Account Status] ,'0') IN ('', '0', '1', '3', '5', '7') AND	
+	(CASE	
+		WHEN [Auxiliary Status Description 1 Text] = 'BANKRUPTCY' THEN 1
+		WHEN [Auxiliary Status Description 2 Text] = 'BANKRUPTCY' THEN 1
+		WHEN [Auxiliary Status Description 3 Text] = 'BANKRUPTCY' THEN 1
+		WHEN [Auxiliary Status Description 4 Text] = 'BANKRUPTCY' THEN 1
+		WHEN [Auxiliary Status Description 5 Text] = 'BANKRUPTCY' THEN 1
+		WHEN [Auxiliary Status Description 6 Text] = 'BANKRUPTCY' THEN 1
+	ELSE 0 END) = 1	
+) a		
+WHERE [Batch_Date] = Min_date
+GROUP BY Batch_Date, Category		
+ORDER BY Batch_Date, Category		
+'''
+########################
+
+########################
+def CreateRollRateQuery(match_risk_book_roll_rates, conn = conn):
+    '''
+    Returns the result of the Roll Rates SQL query based on whether to match Risk Book or use "pure" 
+    
+    Parameters:
+        match_risk_book_roll_rates: boolean True to use Risk Book methodology False to look at "pure" rolls
+    
+    Returns:
+        Pandas DataFrame
+    '''
+    
+    if match_risk_book_roll_rates:
+        return pd.read_sql(Roll_Rate_String_RB, conn)
+    else:
+        return pd.read_sql(Roll_Rate_String_Pure, conn)
+
+    
+Roll_Rate_Query = CreateRollRateQuery(match_risk_book_roll_rates, conn)
+Delinq_Query = pd.read_sql(Delinq_String, conn)
+Delinq_No_Deceased_Bankrupt_Query = pd.read_sql(Delinq_No_Deceased_Bankrupt_String, conn)
+CO_Query = pd.read_sql(CO_String, conn)
+Deceased_Bankruptcy_Query = pd.read_sql(Bankruptcy_Deceased_String, conn)
+
+#Close connections
+try:
+    cursor.close()
+    conn.close()
+except:
+    print("Connection already closed!")
+#########################
+
+#Create a 'Reporting_Date' which normalizes the batch_date to the beginning of the month
+def createReportingDate(Df_):
+    '''
+    Creates a 'Reporting_Date' which is always set to the 1st of the month
+    
+    Parameters:
+        Df_: is a pandas DataFrame
+    
+    Returns: 
+        none
+    '''
+    
+    Df_['Reporting_Date'] = Df_['Batch_Date'] + pd.offsets.Day() - pd.offsets.MonthBegin()
+    
+
+_ = [createReportingDate(Df) for Df in [Roll_Rate_Query, Delinq_Query, Delinq_No_Deceased_Bankrupt_Query, CO_Query, Deceased_Bankruptcy_Query]]
+
+#Create a 'Lead' Reporting Date, this will be used to create the denominator
+def createLeadDate(Df_):
+    '''
+    
+    Creates a field 'Lead_Reporting_Date' which is the Reporting_Date plus 1 month
+    Both 'Reporting_Date' and 'Lead_Reporting_Date' are normalized to the 1st of the month
+    
+    Parameters:
+        Df_: pandas DataFrame
+    
+    Returns: 
+        none
+    '''
+    
+    Df_['Lead_Reporting_Date'] = Df_['Reporting_Date'] + pd.offsets.MonthBegin()
+ 
+_ = [createLeadDate(Df) for Df in [Delinq_Query, Delinq_No_Deceased_Bankrupt_Query]]
+
+#Set DataFrames
+Delinq_Df = Delinq_Query
+CO_Df = CO_Query
+
+def CreateRollRatePandasDf(Roll_Rate_Query_ = Roll_Rate_Query, match_risk_book_roll_rates_ = match_risk_book_roll_rates):
+    '''
+    Creates the pandas DataFrame that contains the Roll Rate information
+    
+    Parameters:
+        Roll_Rate_Query_: pandas DataFrame containing the results of sql query
+        match_risk_book_roll_rates: Boolean True or False match Risk Book methodology or look at "pure" roll rates
+    
+    Returns: 
+        pandas DataFrame
+    '''
+    
+    #Looking at the "pure" rolls methodology
+    if not match_risk_book_roll_rates:
+        #The Roll Rate Dataframe, will Merge with Delinq_No_Deceased_Bankrupt_Query to get the denominator
+        Roll_Rate_Df_ = pd.merge(Roll_Rate_Query_, Delinq_No_Deceased_Bankrupt_Query.drop(['Batch_Date', 'Reporting_Date'], axis = 1), \
+                        how = 'left', \
+                        left_on = ['Reporting_Date', 'FROM_Delinquency'], \
+                        right_on = ['Lead_Reporting_Date', 'Delinquency_Status']).drop(['Delinquency_Status', 'Lead_Reporting_Date'], axis = 1)
+        
+        Roll_Rate_Df_['Balance_Roll_Rate'] = Roll_Rate_Df_['ROLL_BALANCE']/Roll_Rate_Df_['Balance']
+        Roll_Rate_Df_['Units_Roll_Rate'] = Roll_Rate_Df_['ROLL_Units']/Roll_Rate_Df_['Units']
+        Roll_Rate_Df_['Roll_Category'] = Roll_Rate_Df_['FROM_Delinquency'].astype(str) + ' -> ' + Roll_Rate_Df_['TO_Delinquency'].astype(str)
+    
+    #Matching risk book
+    else:
+        Roll_Rate_Df_ = Roll_Rate_Query_.copy()
+        Roll_Rate_Df_['Balance_Roll_Rate'] = Roll_Rate_Df_['Roll_Rate']
+        Roll_Rate_Df_['Roll_Category'] = (Roll_Rate_Df_['Delinquency_Status']-1).astype(str) + ' -> ' + Roll_Rate_Df_['Delinquency_Status'].astype(str)
+        
+    #Below can run regardless of Boolean match_risk_book_roll_rates
+    Roll_Rate_Df_.set_index('Reporting_Date', inplace = True)
+    
+    return Roll_Rate_Df_
+
+#Calling the function
+Roll_Rate_Df = CreateRollRatePandasDf()
+        
+
+#Looking at Deceased/Bankruptcy
+#This will be useful for Deceased/Bankruptcy component
+Aux_Cols = [col for col in CO_Df.columns if 'Auxiliary_Status_Description' in col]
+
+Deceased_lists = [CO_Df[col].str.contains('DEATH') for col in Aux_Cols]
+Bankruptcy_lists = [CO_Df[col].str.contains('BANKRUPTCY') for col in Aux_Cols]
+
+#Creating Deceased and Bankruptcy Indicators
+CO_Df['Deceased_Ind'] = np.sum(pd.concat(Deceased_lists, axis = 1), axis = 1) > 0
+CO_Df['Bankruptcy_Ind'] = np.sum(pd.concat(Bankruptcy_lists, axis = 1), axis = 1) > 0
+#Creating a Recovery column
+CO_Df['Recovery'] = CO_Df['Recovery_Bankruptcy'] + CO_Df['Recovery_Contract']
+CO_Df['NetCO'] = CO_Df['GrossCO'] - CO_Df['Recovery']
+CO_Df['DelinqCO']  = np.where(~(np.logical_or(CO_Df['Deceased_Ind'], CO_Df['Bankruptcy_Ind'])), CO_Df['GrossCO'], 0) 
+CO_Df.set_index('Reporting_Date', inplace = True)
+
+#Create a DataFrame with Balances, Loss, Recoveries, ETC
+LossDf = Delinq_Df.groupby('Reporting_Date')['Balance'].sum().to_frame() #Notice the to Frame method, to convert pandas series to DataFrame
+LossDf['Utilization'] = LossDf['Balance']/Delinq_Df.groupby('Reporting_Date')['Line'].sum()
+LossDf['ThirtyPlus'] = Delinq_Df.loc[Delinq_Df['Delinquency_Status'] >= 2].groupby('Reporting_Date')['Balance'].sum()
+LossDf['ThirtyPlus_NoDeceaseBankrupt'] = Delinq_No_Deceased_Bankrupt_Query.loc[Delinq_No_Deceased_Bankrupt_Query['Delinquency_Status'] >= 2].groupby('Reporting_Date')['Balance'].sum()
+LossDf['New_Deceased'] = Deceased_Bankruptcy_Query.loc[Deceased_Bankruptcy_Query['Category'] == 'DECEASED'].groupby('Reporting_Date')['Balance'].sum()
+LossDf['New_Bankruptcy'] = Deceased_Bankruptcy_Query.loc[Deceased_Bankruptcy_Query['Category'] == 'BANKRUPTCY'].groupby('Reporting_Date')['Balance'].sum()
+LossDf['GrossCO'] = CO_Df.groupby('Reporting_Date')['GrossCO'].sum()
+LossDf['Recovery'] = CO_Df.groupby('Reporting_Date')['Recovery'].sum()
+LossDf['NetCO'] = LossDf['GrossCO'] - LossDf['Recovery']
+LossDf['DelinqCO'] = CO_Df.groupby('Reporting_Date')['DelinqCO'].sum()
+LossDf['DeceasedCO'] = CO_Df[CO_Df['Deceased_Ind']].groupby('Reporting_Date')['GrossCO'].sum()
+LossDf['BankruptCO'] = CO_Df[CO_Df['Bankruptcy_Ind']].groupby('Reporting_Date')['GrossCO'].sum()
+
+
+#Shift the Deceased/Bankruptcy by one, two
+LossDf['New_Deceased_Shift_1'] = LossDf['New_Deceased'].shift(1)
+LossDf['New_Bankruptcy_Shift_1'] = LossDf['New_Bankruptcy'].shift(1)
+LossDf['New_Deceased_Shift_2'] = LossDf['New_Deceased'].shift(2)
+LossDf['New_Bankruptcy_Shift_2'] = LossDf['New_Bankruptcy'].shift(2)
+
+#Filling NA's with 0's, using a loop comprehension
+_ = [LossDf[col].fillna(0, inplace = True) for col in LossDf.columns]
+
+#Calculate Rates
+for col in ['GrossCO', 'Recovery', 'DeceasedCO', 'BankruptCO']:
+    
+    LossDf[col+'_%'] = LossDf[col]/LossDf['Balance']
+
+LossDf['NetCO_%'] = LossDf['GrossCO_%'] - LossDf['Recovery_%']   
+LossDf['Current_%'] = Delinq_Df.loc[Delinq_Df['Delinquency_Status'] == 0].groupby('Reporting_Date')['Balance'].sum().div(LossDf['Balance'].values)
+LossDf['ThirtyPlus_%'] = Delinq_Df.loc[Delinq_Df['Delinquency_Status'] >= 2].groupby('Reporting_Date')['Balance'].sum().div(LossDf['Balance'].values)
+
+
+#########################################################################################################################
+#########################################################################################################################
+
+##Begin Forecasting
+
+#Setting max_date to AsOfDate can be used for backtesting
+if max_date_Boolean:
+    AsOfDate = LossDf.index.max()
+else:
+    AsOfDate = pd.to_datetime(AsOfDate)
+
+# Convert the Seasonality_CutOff_Date to Datetime
+Seasonality_CutOff_Date = pd.to_datetime(Seasonality_CutOff_Date)
+    
+min_date = LossDf.index.min()
+max_date = LossDf.index.max()
+
+forecast_dates = pd.date_range(start = AsOfDate, periods = forecast_period + 1, freq = 'MS')
+
+#Determine the LookBackDate to use
+if n_period_lookback is None:
+    LookBackDate = pd.to_datetime('2019-09-01')
+else:
+    LookBackDate = AsOfDate + pd.DateOffset(months = -n_period_lookback)
+
+def DeceasedBankruptRegression(LossTypeStr = 'Deceased', LossDf_ = None):
+    """
+    Regresses the Deceased/Bankrupt CO on the 2 month lagged newly identified deceased/bankrupt balances.
+    The month is lagged by 2 because typically once an account is tagged as deceased/bankrupt charge off occurs within 60 days
+    or 180 days past due which ever comes first
+    
+    Parameters:
+    
+    LossTypeStr (str): either 'Deceased' or 'Bankruptcy'
+    
+    LossDf_ (pandas DataFrame): The DataFrame containing the historical Data
+    
+    Returns:
+    Stats Model regession object (statsmodels.regression.linear_model.RegressionResultsWrapper)
+    
+    """
+    
+    #Create a date that is 2 months plus the minimum date, this is the minimum date with 2 lagged months
+    min_date_2 = min_date + pd.DateOffset(months = 2)
+    
+    if LossTypeStr.lower() == 'deceased':
+        model_formula_ = 'DeceasedCO ~ New_Deceased_Shift_2'
+    elif LossTypeStr.lower() in ('bankruptcy', 'bankrupt'):
+        model_formula_ = 'BankruptCO ~ New_Bankruptcy_Shift_2'
+    
+    ###############################
+    #Regress 'Deceased CO' vs '2 Lagged New Deceased' and 'Bankruptcy CO' vs '2 Lagged New Bankruptcy'
+    model_reg_ = smf.ols(formula = model_formula_, data = LossDf_.loc[min_date_2 : AsOfDate])
+    
+    return model_reg_.fit()    
+    
+#Call function
+results_Deceased = DeceasedBankruptRegression('Deceased', LossDf)
+results_Bankrupt = DeceasedBankruptRegression('Bankruptcy', LossDf)   
+
+##############################################################################
+
+def CreateBalanceForecast(LossDf_ = None):
+    """
+    Creates a Balance Forecast
+    To encoporate seasonality, find the mean utilization by month
+    Then regress Balance by Utilization
+    
+    Parameters:
+        
+    LossDf_ (pandas DataFrame): The DataFrame containing the historical Data
+    
+    Returns: DataFrame
+    """
+    ##############################################################################
+    ##Balance Forecast
+
+    Balance_Forecast = np.zeros(forecast_period + 1) #Initialize the array
+    Balance_Forecast[0]  = LossDf_.loc[AsOfDate, 'Balance']
+
+    #Obtain the average utilization by month
+    #This is the simplest way to capture seasonality in balances
+    #Note, I am careful to query only up to the AsofDate
+    Utilization_by_Month = LossDf_.loc[:AsOfDate, 'Utilization'].groupby(LossDf_.loc[:AsOfDate, 'Utilization'].index.month).mean()
+    #Regressing the Balance by Utilization
+    mod_Balance_Utilization = smf.ols('Balance ~ Utilization', data = LossDf_.loc[ : AsOfDate]).fit()
+    #Predicting the Balance based on the Utilization calculated
+    Balance_Forecast[1:] = mod_Balance_Utilization.predict(Utilization_by_Month.loc[forecast_dates.month[1:]])
+    #Fill In NA
+    Balance_Forecast[np.isnan(Balance_Forecast)] = Balance_Forecast[0]
+    Balance_Forecast_Df = pd.DataFrame(Balance_Forecast, columns = ['Balance'])
+    Balance_Forecast_Df.index = forecast_dates
+    ###############################################################################
+    
+    return Balance_Forecast_Df
+
+def CreateBalanceForecast2(LossDf_ = None, clipForecast = True):
+    """
+    Creates a Balance Forecast
+    To encoporate seasonality, find the mean utilization by month
+    Then regress Balance by Utilization
+    
+    Parameters:
+        
+    LossDf_ (pandas DataFrame): The DataFrame containing the historical Data
+    clipForecast (bool) default True:
+    
+    Returns: DataFrame
+    """
+    ##############################################################################
+    ##Balance Forecast
+
+
+    Balance_Forecast = np.zeros(forecast_period + 1) #Initialize the array
+    Balance_Forecast[0]  = LossDf_.loc[AsOfDate, 'Balance']
+
+    
+    Balance_Pct_Chg = LossDf_.loc[:AsOfDate,'Balance'].pct_change()
+    #Fillna with 0
+    Balance_Pct_Chg.fillna(Balance_Pct_Chg.mean(), inplace = True)
+    
+    Balance_Pct_Chg_by_Month = Balance_Pct_Chg.groupby(Balance_Pct_Chg.index.month).mean()
+    
+
+    for i in range(1, forecast_period + 1):
+        
+        try:
+            pct_chg = Balance_Pct_Chg_by_Month.loc[forecast_dates[i].month]
+        except:
+            pct_chg = 0
+        
+        
+        Balance_Forecast[i] = Balance_Forecast[i - 1]*(1 + pct_chg)
+        
+        if clipForecast:
+            Balance_Forecast[i] = np.clip(Balance_Forecast[i], a_min = LossDf_.loc[ : AsOfDate, 'Balance'].min(), a_max = LossDf_.loc[ : AsOfDate, 'Balance'].max())
+    
+    Balance_Forecast_Df = pd.DataFrame(Balance_Forecast, columns = ['Balance'])
+    Balance_Forecast_Df.index = forecast_dates
+    ###############################################################################
+    
+    return Balance_Forecast_Df
+
+#Call function
+# 8/2/2022 set clipForecast to False (is set to True by default) Prabhakar Srivastava
+Balance_Forecast_Df = CreateBalanceForecast2(LossDf, clipForecast = False)
+
+def CreateAggregateRates(colStr, Df_ = None, q_ = 0.5, use_quantile = True):
+    """
+    Calculate aggregate values for Recovery, Current, Deceased CO, Bankruptcy CO
+    
+    Parameters:
+        colStr (str): Column string of dataframe
+        Df_ (pandas DataFrame): DataFrame containing historical information
+        q_ (float): quantile, default is 0.5.  0.5 corresponds to the median
+        use_quantile (Boolean): if True aggregate using quantile (q_ = 0.5 is Median)
+        if False use mean
+    Returns:
+        Rate_Agg (numpy array)
+
+    """
+
+    #Can use either Mean or Median
+    #Agg stands for Aggregate: e.g. Mean or Median
+    if use_quantile:
+        Rate_Agg = Df_.loc[LookBackDate : AsOfDate] [colStr].quantile(q_)
+    else:
+        Rate_Agg = Df_.loc[LookBackDate : AsOfDate][colStr].mean()
+    
+    return Rate_Agg
+
+def AggregateRollRates(Df_ = Roll_Rate_Df, rolls_dict = quantile_roll_rates_dict, use_quantile = True):
+    """
+    Aggregate the roll rates by quantiles based on a dictionary of roll, quantiles pairs
+    
+    Parameters:
+        Df_ (pandas DataFrame): Data Frame containing roll rates, defaults to Roll_Rate_Df
+        rolls_dict (dictionary of rolls): dictionary containing key of roll rate and value of quantile
+        use_quantile (Boolean): if True aggregate using quantile (q_ = 0.5 is Median)
+        if False use mean   
+    Returns:
+        Pandas DataFrame
+    """
+    
+    temp_df_ = Df_.loc[LookBackDate : AsOfDate].copy()
+    
+    Roll_Rate_Agg_Dict = {}
+    
+    for key, value in rolls_dict.items():
+        #Need to wrap assignment in a list so I can call pd.DataFrame later
+        if use_quantile:
+            Roll_Rate_Agg_Dict[key] = [temp_df_[temp_df_['Roll_Category'] == key]['Balance_Roll_Rate'].quantile(value)]
+        else:
+            Roll_Rate_Agg_Dict[key] = [temp_df_[temp_df_['Roll_Category'] == key]['Balance_Roll_Rate'].mean()]
+        
+    Roll_Rate_Agg_Df = pd.DataFrame(Roll_Rate_Agg_Dict).transpose() #Tranpose to get 
+    Roll_Rate_Agg_Df.columns = ['Roll_Rate']
+    
+    return Roll_Rate_Agg_Df
+    
+    
+
+#Calling the functions to create the aggregate functions
+Recovery_Rate_Agg = CreateAggregateRates('Recovery_%', LossDf, use_quantile = use_quantile)
+Deceased_CO_Rate_Agg = CreateAggregateRates('DeceasedCO_%', LossDf, use_quantile = use_quantile)
+Bankruptcy_CO_Rate_Agg = CreateAggregateRates('BankruptCO_%', LossDf, use_quantile = use_quantile)
+Roll_Rate_Agg_Df = AggregateRollRates(Roll_Rate_Df, quantile_roll_rates_dict, use_quantile = use_quantile)
+
+#Added on 7/7/2021
+#Main Roll Rates '0 -> 1', '1 -> 2', '2 -> 3', '3 -> 4', '5 -> 6'
+Roll_Rate_Agg_np = Roll_Rate_Agg_Df.loc[Roll_Categories_List].values
+#Roll_Rate_Agg_np = Roll_Rate_Df.loc[AsOfDate, 'Balance_Roll_Rate'].values.reshape(-1, 1)
+
+
+#Create the Loss Delinquency Forecast Matrix
+Delinq_Forecast_Matrix = np.zeros((len(Roll_Rate_Agg_np) + 1, forecast_period + 1))
+#Initialize Deceased, Bankruptcy, and Recovery
+Deceased_Forecast = np.zeros_like(forecast_dates) 
+Bankruptcy_Forecast = np.zeros_like(forecast_dates)
+Recovery_Forecast = np.zeros_like(forecast_dates)
+
+def InitialDelinqForecast(Delinq_Df_ = None, LossDf_ = None):
+    """
+    Initialize the delinquency loss forecast matrix
+    
+    Parameters:
+        D_ (numpy array): Delinquency Matrix
+        Delinq_Df_ (pandas DataFrame): DataFrame used to intialize the month 0 delinquencies
+        LossDf_ (pandas DataFrame): DataFrame used to initialize the month 0 loss, excludes deceased and bankruptcy components
+        
+    Returns:
+        D_: (numpy array)
+        
+    """
+    D_ = np.zeros((8, forecast_period + 1)) # 7 Delinquency Categories + Loss Category
+    D_[0:7, 0] = Delinq_Df_.loc[Delinq_Df_['Reporting_Date'] == AsOfDate, 'Balance']
+    D_[7, 0] = LossDf_.loc[LossDf_.index == AsOfDate, 'GrossCO'] - LossDf_.loc[LossDf_.index == AsOfDate, 'DeceasedCO'] - LossDf_.loc[LossDf_.index == AsOfDate, 'BankruptCO']
+    
+    return D_
+
+Delinq_Forecast_Matrix = InitialDelinqForecast(Delinq_No_Deceased_Bankrupt_Query, LossDf)
+
+def CreateDelinquencyForecast(D_, use_moving_avg = False, n_window = 8):
+    """
+    Creates the delinquency component of the loss forecast
+    
+    Parameters:
+        D_ (numpy array): Delinquency array already initialized
+        use_moving_avg (Boolean): If False then do not use moving_avg to fill in months 8 to 12
+        if True then use
+        n_window (int): window used for moving average applicable for months 8 to 12 of forecast
+    Returns:
+        None
+    """
+    
+    
+    #Loop to create forecast: Rows are Delinquency Buckets: Current, 1-29, 30-59, 60-89,..., Gross Loss
+    for i in range(1, forecast_period + 1):
+    
+        #For first 6 months use the roll rates
+        if not (i == 8) or not use_moving_avg:
+            D_[1:, i] = np.multiply(D_[0:7, i-1].reshape(-1, 1),  Roll_Rate_Agg_np).reshape(-1) #Capturing rolls from '0 -> 1', '1 -> 2', '3 -> 4', '5 -> 6', '6 -> 7'
+            D_[0, i] = Balance_Forecast_Df.values[i] - D_[1:7, i].sum() #Added this line to calculate current based on the balance forecast
+           
+            #month 8 average prior
+        else:
+            D_[:, i] = D_[:, i - n_window : i].mean(axis = 1)
+            
+def CreateDelinquencyForecast_wMA(D_, n_window = 3):
+    """
+    Creates the delinquency component of the loss forecast
+    
+    Parameters:
+        D_ (numpy array): Delinquency array already initialized
+        n_window (int): window used for moving average applicable for months 8 to 12 of forecast
+    Returns:
+        None
+    """
+    
+    
+   #Loop to create forecast: Rows are Delinquency Buckets: Current, 1-29, 30-59, 60-89,..., Gross Loss
+    for i in range(1, forecast_period + 1):
+    
+        #For first 6 months use the roll rates
+        if ((i >= 1) and (i <= 7)):
+            D_[1:, i] = np.multiply(D_[0:7, i-1].reshape(-1,1), Roll_Rate_Agg_np).reshape(-1) #Capturing rolls from '0 -> 1', '1 -> 2', '3 -> 4', '5 -> 6', '6 -> 7'
+            D_[0, i] = Balance_Forecast_Df.values[i] - D_[1:7, i].sum() #Added this line to calculate current based on the balance forecast
+           
+                        
+            #For months 8 to 12 use moving average
+        else:
+            D_[:, i] = D_[:, i - n_window : i].mean(axis = 1)
+  
+
+CreateDelinquencyForecast(Delinq_Forecast_Matrix)
+
+def CreateOtherForecast(colStr, AggRate_, LossDf_ = None):
+    """
+    Intializes Deceased, Bankruptcy, or Recovery Forecast
+    
+    Parameters:
+        colStr (str): either 'DeceasedCO', 'BankruptCO', or 'Recovery'
+        AggRate_ (float): Aggregate Rate
+        LossDf_ (pandas DataFrame): DataFrame used to initialize
+    
+    Returns:
+        Forecast_ (numpy array)
+    """
+    
+    #Ininitalize
+    Forecast_ = np.zeros((forecast_period + 1, 1))
+    
+    Forecast_[0] = LossDf_.loc[AsOfDate, colStr]
+    
+    #Months 1 and 2 come from regression 
+    #Months 3 onwards comes from aggregate rates
+    if 'decease' in colStr.lower():
+        Forecast_[1] = LossDf_.loc[AsOfDate, 'New_Deceased_Shift_1']*results_Deceased.params[1]
+        Forecast_[2] = LossDf_.loc[AsOfDate, 'New_Deceased']*results_Deceased.params[1]
+        Forecast_[3:] = AggRate_*Balance_Forecast_Df.values[3:]
+    elif 'bankrupt' in colStr.lower():
+        Forecast_[1] = LossDf_.loc[AsOfDate, 'New_Bankruptcy_Shift_1']*results_Bankrupt.params[1]
+        Forecast_[2] = LossDf_.loc[AsOfDate, 'New_Bankruptcy']*results_Bankrupt.params[1]
+        Forecast_[3:] = AggRate_*Balance_Forecast_Df.values[3:]
+    elif 'recovery' in colStr.lower():
+        Forecast_[1:] = AggRate_*Balance_Forecast_Df.values[1:]
+
+    return Forecast_
+
+#Calling the functions
+Deceased_Forecast = CreateOtherForecast('DeceasedCO', Deceased_CO_Rate_Agg, LossDf)
+Bankruptcy_Forecast = CreateOtherForecast('BankruptCO', Bankruptcy_CO_Rate_Agg, LossDf)
+Recovery_Forecast = CreateOtherForecast('Recovery', Recovery_Rate_Agg, LossDf)
+
+# Adding Seasonality ADDED 10/25/2021
+def AddSeasonality(Df_, loss_col = 'GrossCO_%', Seasonality_CutOff_Date_ = Seasonality_CutOff_Date):
+    '''
+    Add seasonality to the loss forecast.
+    After month 7, the forecast begins looking flat.
+    Adding seasonality will the forecast more dynamic.
+    
+    This function will decompose the loss and extract the seasonal component
+    
+    Parameters
+    ----------
+    Df_ : pd.DataFrame
+        The DataFrame that contains the gross loss column
+
+    loss_col : str that contains the loss column to use.  The default
+        is to use 'GrossCO_%'.  'NetCO_%' can also be used.
+        
+    Seasonlaity_CutOff_Date_: datetime Which will be cutoff for the Seasonality. Ex. inputting '2021-10-01' will only include
+    seasonality up until '2021-10-01'
+    
+    Returns
+    -------
+    pd.Series containging seasonality by month
+
+    '''
+    
+    lossDf_ = Df_.loc[:Seasonality_CutOff_Date_, loss_col]
+    
+    seasonality_loss = seasonal_decompose(lossDf_, model = 'additive', period = 3) # Uses 'addtive', 'multiplicative' can also be used
+    
+    seasonality_loss_result = seasonality_loss.seasonal
+    
+    seasonality_loss_series = seasonality_loss_result.groupby(seasonality_loss_result.index.month).mean()
+    
+    # reindex and fillna, want to mak sure the complete 12 months is given
+    seasonality_loss_series = seasonality_loss_series.reindex(np.arange(1, 13, 1))
+    seasonality_loss_series.fillna(seasonality_loss_series.mean(), inplace = True)
+    
+    return seasonality_loss_series
+
+# Calling Function    
+Seasonality_Forecast = AddSeasonality(LossDf)   
+
+def CreateLossForecastDataFrame(D_, Deceased_, Bankruptcy_, Recovery_, Seasonality_ = None):
+    """
+    Creates the delinquency forecast matrix
+    
+    Parameters:
+        D_ (numpy Matrix): Delinquency Forecast Matrix
+        Deceased_ (numpy array): Deceased Forecast
+        Bankruptcy_ (numpy array): Bankruptcy Forecast
+        Recovery_ (numpy array): Recovery Forecast
+        Seasonality_ (pd.Series): Seasonality Component
+        
+    Returns:
+        Delinq_Forecast_Df_ (Pandas DataFrame): The forecast dataframe
+    """
+    #Note that reshape (-1, 1) is necessary to ensure the addition is done propery
+    Gross_CO_Forecast = D_[7, :].reshape(-1, 1) + Deceased_ + Bankruptcy_
+    Net_CO_Forecast = Gross_CO_Forecast - Recovery_
+    
+    Delinq_Forecast_Df_ = pd.DataFrame(D_.T) #Set to transpose
+    Delinq_Forecast_Df_.index = pd.date_range(start = AsOfDate, periods = forecast_period + 1, freq = 'MS')
+    Delinq_Forecast_Df_.columns = ['Current', '1-29 Days', '30-59 Days', '60-89 Days', '90-119 Days', '120-149 Days', '150-179 Days', 'DelinqCO']
+    Delinq_Forecast_Df_['DeceasedCO'] = Deceased_
+    Delinq_Forecast_Df_['BankruptCO'] = Bankruptcy_
+    Delinq_Forecast_Df_['GrossCO'] =  Gross_CO_Forecast
+    Delinq_Forecast_Df_['Recovery'] = Recovery_
+    Delinq_Forecast_Df_['NetCO'] = Net_CO_Forecast
+    #Delinq_Forecast_Df_['DelinqCO'] = D_[7, :].reshape(-1, 1)
+    Delinq_Forecast_Df_['ThirtyPlus'] = Delinq_Forecast_Df_[['30-59 Days', '60-89 Days', '90-119 Days', \
+                       '120-149 Days', '150-179 Days']].sum(axis = 1)
+    Delinq_Forecast_Df_['Balance'] = Delinq_Forecast_Df_[['Current', '1-29 Days', '30-59 Days', '60-89 Days', '90-119 Days', '120-149 Days', '150-179 Days']].sum(axis = 1)
+   
+    # Add Seasonality
+    if Seasonality_ is not None:
+        # Extract the Seasonality
+        Seasonality = Seasonality_.loc[Delinq_Forecast_Df_.index.month]
+        Seasonality.iloc[:8] = 0 # Only need to apply seasonality adjustment after month 7, indices from 0 to 7 are set to 0
+        # The :8 gives 0 to 7, 8 is not inclusive
+        
+        Delinq_Forecast_Df_['Seasonality'] = Seasonality.values*Delinq_Forecast_Df_['Balance'].values 
+        Delinq_Forecast_Df_['GrossCO'] = Delinq_Forecast_Df_['GrossCO'] + Delinq_Forecast_Df_['Seasonality'] # Overwrite GrossCO to include seasonality component
+        Delinq_Forecast_Df_['NetCO'] = Delinq_Forecast_Df_['NetCO'] + Delinq_Forecast_Df_['Seasonality'] # Overwrite NetCO to include seasonality component
+    
+    #Calculate %'s
+    Delinq_Forecast_Df_['GrossCO_%'] = 12*Delinq_Forecast_Df_['GrossCO']/Delinq_Forecast_Df_[['Current', '1-29 Days', '30-59 Days', '60-89 Days', '90-119 Days', '120-149 Days', '150-179 Days']].sum(axis = 1)
+    Delinq_Forecast_Df_['NetCO_%'] = 12*Delinq_Forecast_Df_['NetCO']/Delinq_Forecast_Df_[['Current', '1-29 Days', '30-59 Days', '60-89 Days', '90-119 Days', '120-149 Days', '150-179 Days']].sum(axis = 1)
+    Delinq_Forecast_Df_['ThirtyPlus_%'] = Delinq_Forecast_Df_['ThirtyPlus']/Delinq_Forecast_Df_[['Current', '1-29 Days', '30-59 Days', '60-89 Days', '90-119 Days', '120-149 Days', '150-179 Days']].sum(axis = 1)
+
+    
+    return Delinq_Forecast_Df_
+
+Delinq_Forecast_Df = CreateLossForecastDataFrame(Delinq_Forecast_Matrix, Deceased_Forecast, Bankruptcy_Forecast, Recovery_Forecast, Seasonality_Forecast)   
+#########################################################################################################################################
+
+
+#Plot the Delinquency component only
+if max_date in forecast_dates:
+    end_element = np.argmax(forecast_dates == max_date) + 1 #This calculates where the ending date is in array
+else:
+    end_element = len(forecast_dates)
+#################################################################################################
+## Creating a tab in the risk book
+Risk_Book_tab_Df = Delinq_Forecast_Df[['Current', '1-29 Days', '30-59 Days', '60-89 Days', \
+                                    '90-119 Days', '120-149 Days', '150-179 Days', 'DelinqCO', \
+                                    'DeceasedCO', 'BankruptCO','GrossCO', 'Recovery', 'NetCO']].transpose()
+
+#Renaming the columns so that column names are better formatted 
+Risk_Book_tab_Df.columns = Risk_Book_tab_Df.columns.strftime('%m/%d/%Y')
+Risk_Book_tab_Df.reset_index(inplace = True)
+Risk_Book_tab_Df.rename(columns = {'index':'Metric'}, inplace = True)
+
+##Outputing Excel
+try:
+    if export_Excel:
+    
+        #Exporting Risk Book Tab in Risk_Book_tab
+        writer = pd.ExcelWriter(os.path.join(file_path, 'ForecastTab' + file_name + '.xlsx'), engine = 'xlsxwriter')
+        Risk_Book_tab_Df.to_excel(writer, sheet_name = 'Forecast', index = False)
+    
+        worksheet = writer.sheets['Forecast']
+        worksheet.set_column('A:T', 30)
+    
+        writer.save()
+        writer.close()
+except:
+    print("Unable to export!")
+
+####################################################################################################
+
+
+#####################################################################################################
+## Below is a comparision of Forecasts versus actuals
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.dates as mdates
+
+
+sns.set_style("darkgrid")
+
+plot_date_range = pd.date_range(AsOfDate + pd.DateOffset(months = 1), AsOfDate + pd.DateOffset(months = 12), freq = 'MS')
+
+
+
+def PercentError(actual, forecast, col = 'NetCO', dates_ = plot_date_range):
+    """
+    Calculate the % error for by comparing actuals and forecast
+    
+    Parameters
+    ----------
+    actual : pd.DataFrame
+        Actual values
+    forecast : pd.DataFrame
+        Forecasted values
+    col : str, optional
+        DESCRIPTION. The default is 'NetCO'.
+    dates_ : iterable of dates, optional
+        DESCRIPTION. The default is plot_date_range.
+        
+    Returns
+    -------
+    Float64
+
+    """
+    
+    actual_ = actual.loc[dates_, col]
+    forecast_ = forecast.loc[dates_, col]
+    
+    return np.abs(np.sum(forecast_ - actual_))/np.sum(actual_)
+
+if AsOfDate < LossDf.index.max():
+    Comparison_Df = pd.concat([LossDf.loc[plot_date_range, 'NetCO'], Delinq_Forecast_Df.loc[plot_date_range, 'NetCO']], axis = 1)
+    Comparison_Df.columns = ['Actual', 'Predicted']
+    Comparison_Df['Date'] = Comparison_Df.index.strftime('%b-%Y')
+    Comparison_Df['Error'] = (Comparison_Df['Predicted'] - Comparison_Df['Actual'])/Comparison_Df['Actual']
+    Comparison_Df = Comparison_Df[['Date', 'Actual', 'Predicted', 'Error']]a
+    
+    perc_error = PercentError(LossDf, Delinq_Forecast_Df)
+
+    fig, ax = plt.subplots()
+    sns.lineplot(x = plot_date_range, y = LossDf.loc[plot_date_range, 'NetCO'].div(1e3), label = 'Actual', ax = ax)
+    ax.plot(plot_date_range, Delinq_Forecast_Df.loc[plot_date_range, 'NetCO'].div(1e3), label = 'Forecast')
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval = 1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%Y'))
+    ax.set_ylabel('$ in 1000s')
+    ax.set_title("Actual versus Forecast as of {} \n % error {:.2f}%".format(AsOfDate.strftime('%b-%Y'), 100*perc_error), fontweight = "bold")
+    fig.autofmt_xdate()
+    plt.legend()
+    plt.show()
+else:
+    fig, ax = plt.subplots()
+    sns.lineplot(x = plot_date_range, y = Delinq_Forecast_Df.loc[plot_date_range, 'NetCO'].div(1e3))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval = 1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b-%Y'))
+    ax.set_ylabel('$ in 1000s')
+    ax.set_title("Forecast", fontweight = "bold")
+    fig.autofmt_xdate()
+    plt.show()
+######################################################################################################
+
